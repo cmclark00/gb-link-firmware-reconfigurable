@@ -33,8 +33,14 @@
 #include <stdio.h>
 #include <string.h>
 #include "hardware/pio.h"
+#include "hardware/clocks.h" // Required for clock_get_hz
 #include "pio/pio_spi.h"
+#include "spi.pio.h"      // Generated PIO header for SPI
 #include "pico/time.h"
+#include "pico/stdlib.h"  // Required for stdio_init_all
+
+#include "pokemon_data.h" // For Gen1PokemonPartyData and related functions
+#include <stdio.h>        // For printf
 
 #define NUM_CMP_BYTES 0x20
 #define NUM_CMP_BYTES_RECV (NUM_CMP_BYTES+4)
@@ -44,23 +50,12 @@
 
 #define MAX_TRANSFER_BYTES 0x40
 
-#define PIN_SCK 0
-#define PIN_SIN 1
-#define TEST_PIN 6
-
-uint PIN_SOUT = 2;
-uint SI_PIN = 3;
-
-bool is_test_pin_grounded() {
-  gpio_init(TEST_PIN);
-  gpio_set_dir(TEST_PIN, GPIO_OUT);
-  gpio_put(TEST_PIN, 1);  // Set the pin high
-
-  // Read the state of the pin
-  bool grounded = gpio_get(TEST_PIN) == 0;
-
-  return grounded;
-}
+// CRITICAL: Game Boy operates at 5V logic. Level shifters (e.g., bidirectional 3.3V-5V)
+// MUST be used on GB_PIN_CLK, GB_PIN_DATA_OUT, and GB_PIN_DATA_IN when connecting
+// to a Game Boy to prevent damage to the RP2040 and ensure reliable communication.
+#define GB_PIN_CLK 0       // Game Boy Link Cable Clock
+#define GB_PIN_DATA_OUT 1  // Data Out from RP2040 to Game Boy
+#define GB_PIN_DATA_IN 2   // Data In from Game Boy to RP2040
 
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF PROTYPES
@@ -100,46 +95,54 @@ const tusb_desc_webusb_url_t desc_url =
 
 static bool web_serial_connected = false;
 
+// Global PIO SPI instance for Game Boy communication
+pio_spi_inst_t g_gb_spi_inst;
+
+// Global Pokemon data for trading
+Gen1PokemonPartyData g_outgoing_pokemon;
+Gen1PokemonPartyData g_received_pokemon;
+#define GEN1_TRADE_POKEMON_BLOCK_SIZE 44
+
 //------------- prototypes -------------//
+void prepare_outgoing_magikarp(void);
+void execute_trade_sequence(void);
 void handle_input_data(uint8_t* buf_in, uint32_t count);
-void data_transfer_task(void);
+// void data_transfer_task(void); // Already commented out
 void led_blinking_task(void);
 void cdc_task(void);
 void webserial_task(void);
 
 /*------------- MAIN -------------*/
 
-  pio_spi_inst_t spi = {
-          .pio = pio1,
-          .sm = 0
-  };
+  // pio_spi_inst_t spi = {
+  //         .pio = pio1,
+  //         .sm = 0
+  // };
 
 
 int main(void)
 {
-  // Check the state of TEST_PIN
-  if (is_test_pin_grounded()) {
-    // GPIO 6 (TEST_PIN) is grounded, update PIN_SOUT and SI_PIN
-    PIN_SOUT = 3;
-    SI_PIN = 4;
-  }
-  else {
-    // GPIO 6 (TEST_PIN) is not grounded, use default values
-    PIN_SOUT = 2;
-    SI_PIN = 3;
-  }
+  stdio_init_all(); // Initialize stdio for printf over USB CDC
+  printf("Board Initializing...\n");
 
-  //board_init();
+  //board_init(); // board_init() is usually called by TinyUSB or not needed if using board_led_write directly
   buf_count = 0;
-  uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
-  pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
+  // uint cpha1_prog_offs = pio_add_program(spi.pio, &spi_cpha1_program);
+  // pio_spi_init(spi.pio, spi.sm, cpha1_prog_offs, 8, 4058.838/128, 1, 1, PIN_SCK, PIN_SOUT, PIN_SIN);
+
+  gpio_init(GB_PIN_CLK);
+  gpio_init(GB_PIN_DATA_OUT);
+  gpio_init(GB_PIN_DATA_IN);
 
   tusb_init();
+
+  // Initialize Game Boy serial communication
+  gb_serial_init(0, 0, GB_PIN_CLK, GB_PIN_DATA_OUT, GB_PIN_DATA_IN, 8192);
 
   while (1)
   {
     tud_task(); // tinyusb device task
-    data_transfer_task();
+    // data_transfer_task();
     cdc_task();
     webserial_task();
     led_blinking_task();
@@ -289,56 +292,149 @@ bool tud_vendor_control_complete_cb(uint8_t rhport, tusb_control_request_t const
   return true;
 }
 
-void data_transfer_task(void) {
-    //if(buf_count) {
-        //uint8_t buf_out[MAX_TRANSFER_BYTES];
-    //    for(int i = 0; i < (buf_count+3) >> 2; i++) {
-    //        pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
-    //        busy_wait_us(36);
-    //    }
-        //pio_spi_write8_read8_blocking(&spi, data_buf, buf_out, buf_count);
-        //echo_all(buf_out, buf_count);
-    //    buf_count = 0;
-    //}
+// void data_transfer_task(void) {
+//     //if(buf_count) {
+//         //uint8_t buf_out[MAX_TRANSFER_BYTES];
+//     //    for(int i = 0; i < (buf_count+3) >> 2; i++) {
+//     //        pio_spi_write8_blocking(&spi, data_buf+(4*i), 4);
+//     //        busy_wait_us(36);
+//     //    }
+//         //pio_spi_write8_read8_blocking(&spi, data_buf, buf_out, buf_count);
+//         //echo_all(buf_out, buf_count);
+//     //    buf_count = 0;
+//     //}
+// }
+
+// Game Boy Serial Communication Functions
+bool gb_serial_init(PIO pio_instance_num, uint sm_num, uint clk_pin, uint data_out_pin, uint data_in_pin, uint32_t gb_baud_rate) {
+    PIO pio = (pio_instance_num == 0) ? pio0 : pio1;
+    uint offset = pio_add_program(pio, &spi_cpha1_program);
+    float clkdiv = (float)clock_get_hz(clk_sys) / (gb_baud_rate * 2.0f);
+
+    g_gb_spi_inst.pio = pio;
+    g_gb_spi_inst.sm = sm_num;
+    g_gb_spi_inst.cs_pin = -1; // Not used by pio_spi_init directly
+
+    pio_spi_init(g_gb_spi_inst.pio, g_gb_spi_inst.sm, offset, 8, clkdiv, true /*cpha=1*/, false /*cpol=0*/, clk_pin, data_out_pin, data_in_pin);
+    return true;
+}
+
+uint8_t gb_serial_exchange_byte(uint8_t byte_to_send) {
+    uint8_t received_byte;
+    pio_spi_write8_read8_blocking(&g_gb_spi_inst, &byte_to_send, &received_byte, 1);
+    return received_byte;
 }
 
 void handle_input_data(uint8_t* buf_in, uint32_t count) {
-  for(int i = count; i < (MAX_TRANSFER_BYTES*2); i++)
-    buf_in[i] = 0;
-  uint8_t processed = 0;
-  if(count == NUM_CMP_BYTES_RECV) {
-    uint8_t failed = 0;
-    for(int i = 0; i < NUM_CMP_BYTES; i++)
-      if(buf_in[i] != compare_bytes[i]) {
-        failed = 1;
-        break;
-      }
-    if(!failed) {
-      us_between_transfer = (buf_in[NUM_CMP_BYTES]<<0) + (buf_in[NUM_CMP_BYTES+1]<<8) + (buf_in[NUM_CMP_BYTES+2]<<16);
-      num_bytes_per_transfer = buf_in[NUM_CMP_BYTES+3];
-      if(num_bytes_per_transfer > MAX_TRANSFER_BYTES)
-        num_bytes_per_transfer = MAX_TRANSFER_BYTES;
-      processed = 1;
-      echo_all(&processed, 1);
+    // To be implemented later for Pokemon trading commands
+    // For now, can echo back or do nothing
+    // echo_all(buf_in, count); // Optional: echo back for testing USB
+
+    if (count > 0 && buf_in[0] == 't') {
+        printf("Trade command 't' received.\n");
+        prepare_outgoing_magikarp();
+        execute_trade_sequence();
+    } else if (count > 0 && buf_in[0] == 'h') {
+        printf("Commands:\n t - Initiate Trade\n h - Help\n");
     }
-  }
-  if(!processed) {
-    // pprintf("Sending: %02x", buf[0]);
-    uint8_t total_processed = 0;
-    uint8_t buf_out[MAX_TRANSFER_BYTES*2];
-    while(total_processed < count) {
-      uint8_t transferable = num_bytes_per_transfer;
-      //if(count-total_processed < transferable)
-        //transferable = count-total_processed;
-      pio_spi_write8_read8_blocking(&spi, buf_in + total_processed, buf_out + total_processed, transferable);
-      total_transferred += transferable;
-      total_processed += transferable;
-      busy_wait_us(us_between_transfer);
-    }
-    echo_all(buf_out, total_processed);
-    //echo_all(&availables, 1);
-  }
+    // echo_all(buf_in, count); // Commented out to prevent interference with printf debugging
 }
+
+void prepare_outgoing_magikarp() {
+    printf("Preparing Magikarp Lvl 1 for trade...\n");
+    // OT Name for Magikarp is "RP2040" (6 chars + 0x50 terminator = 7 bytes)
+    // Nickname for Magikarp is "MAGIKARP" (8 chars + 0x50 terminator = 9 bytes, padded to 11)
+    // create_tradeable_magikarp_lvl1 handles padding.
+    create_tradeable_magikarp_lvl1(&g_outgoing_pokemon, "RP2040", 0x1234); // Example OT Name and ID
+    printf("Magikarp ready. Species: %d (0x%02X), Level: %d, OT: %s, Nick: %s\n", 
+           g_outgoing_pokemon.species_id, g_outgoing_pokemon.species_id, 
+           g_outgoing_pokemon.level, g_outgoing_pokemon.ot_name, g_outgoing_pokemon.nickname);
+    // Basic check of a few bytes that will be sent
+    printf("Outgoing data sample: Species=0x%02X, Move1=0x%02X, Type1=0x%02X, Level=%d\n", 
+           ((uint8_t*)&g_outgoing_pokemon)[0], ((uint8_t*)&g_outgoing_pokemon)[8], 
+           ((uint8_t*)&g_outgoing_pokemon)[5], ((uint8_t*)&g_outgoing_pokemon)[0x21]);
+}
+
+void execute_trade_sequence() {
+    // Zero out the received Pokemon struct before the trade
+    memset(&g_received_pokemon, 0, sizeof(Gen1PokemonPartyData)); 
+    printf("Starting trade sequence (g_received_pokemon zeroed)...\n");
+
+    // Gen 1 Trade Protocol Overview (simplified):
+    // 1. Handshake:
+    //    - Master sends 0x01 (LINK_MODE_NORMAL), Slave responds 0x01.
+    //    - Master sends 0x02 (LINK_ACTION_REQ_BLOCK) to become master, Slave responds 0x01.
+    //    - Master sends 0xFD (LINK_VERSION_CHECK), Slave responds 0xFD.
+    //    (These steps establish roles and verify compatibility)
+    //
+    // 2. Random Data Exchange (Entropy):
+    //    - Master and Slave exchange blocks of random data (e.g., 256 bytes).
+    //    - This helps ensure link quality and provides entropy for other operations.
+    //
+    // 3. Player/Pokemon Info Exchange (Trade Setup):
+    //    - Exchange player names.
+    //    - Exchange number of Pokémon in party.
+    //    - Exchange species list of party Pokémon.
+    //    - Exchange OT names of party Pokémon.
+    //    - Exchange nicknames of party Pokémon.
+    //    - Selection of Pokémon to trade by each player.
+    //
+    // 4. Core Pokémon Data Exchange:
+    //    - The actual 44-byte data block for the selected Pokémon is exchanged.
+    //    - This contains species, stats, moves, IVs, EVs, etc.
+    //
+    // 5. Confirmation/Checksum:
+    //    - Potentially a checksum or final confirmation bytes.
+    //
+    // Simplified Implementation for this subtask: Direct 44-byte data block exchange.
+
+    uint8_t send_buffer[GEN1_TRADE_POKEMON_BLOCK_SIZE];
+    uint8_t receive_buffer[GEN1_TRADE_POKEMON_BLOCK_SIZE];
+
+    // The g_outgoing_pokemon struct (62 bytes) has the 44-byte core data block at the beginning.
+    memcpy(send_buffer, &g_outgoing_pokemon, GEN1_TRADE_POKEMON_BLOCK_SIZE);
+
+    printf("Sending Magikarp data (%d bytes)...\n", GEN1_TRADE_POKEMON_BLOCK_SIZE);
+    printf("Simulating byte-by-byte exchange with Game Boy (相手NPCなど)...\n");
+
+    for (int i = 0; i < GEN1_TRADE_POKEMON_BLOCK_SIZE; ++i) {
+        receive_buffer[i] = gb_serial_exchange_byte(send_buffer[i]);
+        // Optional: printf("Sent: 0x%02X, Rcvd: 0x%02X\n", send_buffer[i], receive_buffer[i]);
+        // busy_wait_us(100); // Small delay, adjust if necessary, might not be needed with PIO handling
+    }
+
+    printf("Data exchange complete.\n");
+
+    // Copy received data into the 44-byte core section of g_received_pokemon.
+    // Nickname and OT name fields in g_received_pokemon will remain uninitialized by this memcpy,
+    // as they are located after the first 44 bytes in the Gen1PokemonPartyData struct.
+    memcpy(&g_received_pokemon, receive_buffer, GEN1_TRADE_POKEMON_BLOCK_SIZE);
+
+    printf("Received Pokemon Data (populated first 44 bytes into g_received_pokemon):\n");
+    printf("  Species ID: %d (0x%02X)\n", g_received_pokemon.species_id, g_received_pokemon.species_id);
+    printf("  Level: %d\n", g_received_pokemon.level);
+    // Display OT Name and Nickname - these are outside the 44-byte block, so they'll show zeroed data.
+    printf("  Received Pokemon OT Name (raw, from 62-byte struct): %.*s\n", GEN1_POKEMON_OT_NAME_LENGTH, g_received_pokemon.ot_name);
+    printf("  Received Pokemon Nickname (raw, from 62-byte struct): %.*s\n", GEN1_POKEMON_NICKNAME_LENGTH, g_received_pokemon.nickname);
+    // Display stats as requested
+    printf("  Received Stats - HP:%d, Atk:%d, Def:%d, Spd:%d, Spc:%d\n", 
+           g_received_pokemon.max_hp, g_received_pokemon.attack, g_received_pokemon.defense, 
+           g_received_pokemon.speed, g_received_pokemon.special);
+    printf("  Received Types - Type1: 0x%02X, Type2: 0x%02X\n", 
+           g_received_pokemon.type1, g_received_pokemon.type2);
+    printf("  Received Moves - M1:0x%02X, M2:0x%02X, M3:0x%02X, M4:0x%02X\n",
+           g_received_pokemon.move1_id, g_received_pokemon.move2_id, g_received_pokemon.move3_id, g_received_pokemon.move4_id);
+    
+    // It's good practice to print a few raw received bytes too
+    printf("Raw received data sample (first 8 bytes of receive_buffer): ");
+    for(int i=0; i<8; ++i) { // Print first 8 bytes
+        printf("0x%02X ", receive_buffer[i]);
+    }
+    printf("\n");
+    
+    printf("Trade sequence finished.\n");
+}
+
 
 void webserial_task(void)
 {

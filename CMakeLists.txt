@@ -14,6 +14,7 @@ target_include_directories(gbusb PRIVATE ${CMAKE_CURRENT_LIST_DIR})
 
 target_sources(gbusb PRIVATE
         main.c
+        pokemon_data.c
 
         usb_descriptors.c
 
