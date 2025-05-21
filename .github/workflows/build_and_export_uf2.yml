@@ -1,0 +1,41 @@
+name: Build RP2040 Project and Export UF2
+
+on:
+  push:
+    branches:
+      - main # Or your default branch, e.g., master
+
+jobs:
+  build_project:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4 # Using v4 for latest features/security
+
+      - name: Set up Pico SDK
+        uses: raspberrypi/pico-setup-sdk@v2 # Using v2, check for latest stable
+        with:
+          pico_sdk_version: 'latest' # Or a specific version like '1.5.1'
+
+      - name: Create Build Directory
+        run: mkdir build
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          cd build
+          cmake .. -DPICO_SDK_PATH=$PICO_SDK_PATH
+        
+      - name: Build Project
+        shell: bash
+        run: |
+          cd build
+          make -j$(nproc)
+
+      - name: Upload UF2 Artifact
+        uses: actions/upload-artifact@v4 # Using v4
+        with:
+          name: rp2040-firmware # Name of the artifact zip file
+          path: build/gbusb.uf2 # Path to the UF2 file
+          if-no-files-found: error # Fail the workflow if UF2 is not found
